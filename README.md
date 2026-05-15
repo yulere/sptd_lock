@@ -19,6 +19,63 @@
 
 ---
 
+# Architectural Comparison: Kernel Semaphore vs. SHM + Process-Shared Mutex
+
+Normally for Inter-Process Communication (IPC) synchronization under Linux, we use a **Shared Memory (SHM) + Process-Shared Thread Mutex** (`pthread_mutex_t` with `PTHREAD_PROCESS_SHARED`), here we use **Kernel Semaphore**. First let's look at the differences:
+
+---
+
+## 1. Core Architectural Differences
+
+The primary differentiator between these two mechanisms is the execution space where the synchronization logic takes place:
+
+*   **Kernel Semaphore:** The synchronization structure resides entirely within kernel space. Every lock acquisition or release operation requires a trap to the operating system kernel via a system call (`semop` or `sem_wait`).
+*   **SHM + Process-Shared Mutex:** The synchronization structure (`pthread_mutex_t`) resides inside a shared memory segment mapped directly into the virtual address spaces of the participating processes. It leverages the Linux `futex` (Fast Userspace Mutex) architecture.
+
+---
+
+## 2. Technical Feature Matrix
+
+
+| Technical Metric | Kernel Semaphore Locks | SHM + Process-Shared Mutex |
+| :--- | :--- | :--- |
+| **Memory Allocation** | Kernel memory space. | Shared user memory page (`shmget` / `mmap`). |
+| **Uncontended Lock Cost** | **High Overhead** (Requires a system call every time). | **Near Zero** (Executed via atomic CPU instructions in userspace). |
+| **Contended Lock Cost** | **High Overhead** (Immediate transition to kernel wait queue). | **Adaptive Overhead** (Can spin briefly in userspace before sleeping). |
+| **Data Locality** | Separated from data payload (Causes CPU cache misses). | Colocated with data payload (High L1/L2 cache efficiency). |
+| **Crash Safety** | Native automatic cleanup via kernel `SEM_UNDO`. | Manual cleanup required via `PTHREAD_MUTEX_ROBUST`. |
+| **Resource Limits** | Restricted by OS IPC system configurations (`semmni`, `semmsl`). | Bound only by standard virtual memory limits. |
+| **Security & Sandbox Isolation** | **High Isolation** (Exposed via discrete sysfs endpoints). | **Low Isolation** (Relies on wide `/dev/shm` filesystem access). |
+
+---
+
+## 3. Performance Dynamics & Execution Paths
+
+### The Fast-Path Optimization
+The **SHM + Process-Shared Mutex** utilizes a "fast-path" optimization. When a process attempts to lock an uncontended mutex, the CPU executes an atomic operation (e.g., `CMPXCHG` on x86 architectures) entirely within userspace. 
+
+The kernel is completely bypassed during uncontended operations. The system only drops into a "slow-path" (issuing a `futex` system call to put the process to sleep) if a collision occurs.
+
+---
+
+## 4. Why We Use Kernel Semaphore: Sandboxing & Container Security
+
+While **SHM + Process-Shared Mutex** offers superior performance, it introduces significant deployment roadblocks in locked-down or containerized environments due to file path requirements:
+
+### The `/dev/shm` Security Bottleneck
+Standard POSIX shared memory allocations rely on mounting the shared memory filesystem to `/dev/shm`. In multi-tenant environments, hardened systems, or Docker/Kubernetes setups, security policies often block or limit access to the host's `/dev/shm`. 
+* Granting container access to `/dev/shm` can leak sensitive data between processes or break container isolation boundaries.
+* Without `/dev/shm` permissions, a userspace `pthread_mutex_t` cannot be safely exposed across process boundaries.
+
+### The Sysfs Solution via Kernel Semaphores
+**Kernel Semaphores** bypass filesystem-level dependency traps. Instead of exposing a broad memory page shared in userspace, synchronization can be safely bound to a highly restricted sysfs interface—for example, `/sys/devices/platform/sptd_lock/lock_mgr`. 
+
+* **Granular Access Control:** Standard Linux file permissions (`chmod`/`chown`) or fine-grained SELinux policies can be applied directly to the specific sysfs endpoint.
+* **Secure Isolation:** Subsystems or containers can safely lock and unlock resources via standard kernel operations without needing dangerous read/write permissions to a shared userspace memory pool.
+* **Deterministic Lifetime:** The lock infrastructure stays coupled directly to the hardware/platform driver lifecycle rather than volatile user memory segments.
+
+---
+
 ## How to Build and Load
 
 ### 1. Prerequisites
